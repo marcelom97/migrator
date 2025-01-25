@@ -64,10 +64,21 @@ func main() {
 
 ## How It Works
 
-1. Creates a `schema_migrations` table to track applied migrations
-2. Reads embedded SQL files in alphabetical order
-3. Executes pending migrations within transactions
-4. Records successful migrations in the `schema_migrations` table
+1. Acquires a PostgreSQL advisory lock to prevent concurrent migrations
+2. Creates a `schema_migrations` table to track applied migrations
+3. Wraps all operations in a transaction for atomicity
+4. Reads embedded SQL files in alphabetical order
+5. Executes pending migrations within the transaction
+6. Records successful migrations in the `schema_migrations` table
+7. Releases the advisory lock
+
+## Concurrent Safety
+
+The migrator is designed to be safe in distributed environments where multiple instances might try to run migrations simultaneously:
+
+- Uses PostgreSQL advisory locks to ensure only one instance can run migrations at a time
+- Other instances will receive a "another migration is in progress" error
+- All database operations are wrapped in a transaction
 
 ## Contributing
 

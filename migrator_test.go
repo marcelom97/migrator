@@ -48,23 +48,26 @@ func TestMigrator(t *testing.T) {
 		db, schema, closeDB := openDB(t)
 		defer closeDB()
 		m := New(db, testMigrations)
-		if err := m.createMigrationsTable(); err != nil {
-			t.Fatalf("failed to create migrations table: %v", err)
-		}
-
-		// Verify table exists
-		var exists bool
-		if err := db.QueryRow(fmt.Sprintf(`
+		if err := m.tx(func(tx *sql.Tx) error {
+			if err := m.createMigrationsTable(tx); err != nil {
+				return fmt.Errorf("failed to create migrations table: %w", err)
+			}
+			var exists bool
+			if err := tx.QueryRow(fmt.Sprintf(`
 			SELECT EXISTS (
 				SELECT FROM pg_tables
 				WHERE schemaname = '%s'
 				AND tablename = 'schema_migrations'
 			);
 		`, schema)).Scan(&exists); err != nil {
-			t.Fatalf("failed to check if migrations table exists: %v", err)
-		}
-		if !exists {
-			t.Fatal("migrations table does not exist")
+				return fmt.Errorf("failed to check if migrations table exists: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("migrations table does not exist")
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("failed to create migrations table: %v", err)
 		}
 	})
 
@@ -76,7 +79,6 @@ func TestMigrator(t *testing.T) {
 			t.Fatalf("failed to run migrations: %v", err)
 		}
 
-		// Verify migrations were applied
 		rows, err := db.Query("SELECT version FROM schema_migrations ORDER BY version")
 		if err != nil {
 			t.Fatalf("failed to get applied migrations: %v", err)
@@ -92,7 +94,6 @@ func TestMigrator(t *testing.T) {
 			versions = append(versions, version)
 		}
 
-		// Verify all migrations were applied in order
 		expectedVersions := []string{
 			"001_create_test_table",
 			"002_add_test_column",
@@ -106,7 +107,6 @@ func TestMigrator(t *testing.T) {
 			}
 		}
 
-		// Verify the actual schema changes
 		var exists bool
 		if err := db.QueryRow(`
 			SELECT EXISTS (
@@ -128,7 +128,6 @@ func TestMigrator(t *testing.T) {
 		defer closeDB()
 		m := New(db, testMigrations)
 
-		// Run migrations twice
 		if err := m.Run(); err != nil {
 			t.Fatalf("failed to run migrations: %v", err)
 		}
@@ -136,7 +135,6 @@ func TestMigrator(t *testing.T) {
 			t.Fatalf("failed to run migrations: %v", err)
 		}
 
-		// Verify migrations were applied only once
 		var count int
 		if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 			t.Fatalf("failed to get applied migrations count: %v", err)
@@ -149,10 +147,85 @@ func TestMigrator(t *testing.T) {
 	t.Run("handles invalid migration files", func(t *testing.T) {
 		db, _, closeDB := openDB(t)
 		defer closeDB()
-		// Create a new migrator with invalid SQL
+
 		m := New(db, invalidTestMigrations)
 		if err := m.Run(); err == nil {
 			t.Fatal("expected error, got nil")
 		}
 	})
+}
+
+func TestConcurrentMigrations(t *testing.T) {
+	tests := []struct {
+		name            string
+		instances       int
+		expectedSuccess int
+		expectedLocks   int
+	}{
+		{
+			name:            "two concurrent instances",
+			instances:       2,
+			expectedSuccess: 1,
+			expectedLocks:   1,
+		},
+		{
+			name:            "five concurrent instances",
+			instances:       5,
+			expectedSuccess: 1,
+			expectedLocks:   4,
+		},
+		{
+			name:            "ten concurrent instances",
+			instances:       10,
+			expectedSuccess: 1,
+			expectedLocks:   9,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, _, closeDB := openDB(t)
+			defer closeDB()
+
+			done := make(chan error, tt.instances)
+
+			for i := 0; i < tt.instances; i++ {
+				go func() {
+					m := New(db, testMigrations)
+					done <- m.Run()
+				}()
+			}
+
+			var (
+				successCount int
+				lockCount    int
+			)
+
+			for i := 0; i < tt.instances; i++ {
+				err := <-done
+				if err == nil {
+					successCount++
+				} else if err.Error() == "another migration is in progress" {
+					lockCount++
+				} else {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+
+			if successCount != tt.expectedSuccess {
+				t.Errorf("expected %d successful migrations, got %d", tt.expectedSuccess, successCount)
+			}
+			if lockCount != tt.expectedLocks {
+				t.Errorf("expected %d lock failures, got %d", tt.expectedLocks, lockCount)
+			}
+
+			var count int
+			if err := db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
+				t.Fatalf("failed to get applied migrations count: %v", err)
+			}
+			if count != 2 {
+				t.Fatalf("expected 2 applied migrations, got %d", count)
+			}
+		})
+	}
 }
