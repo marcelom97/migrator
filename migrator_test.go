@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -16,10 +17,10 @@ var testMigrations embed.FS
 //go:embed testdata/invalid/*.sql
 var invalidTestMigrations embed.FS
 
-func openDB(t *testing.T) (*sql.DB, func()) {
+func openDB(t *testing.T) (*sql.DB, string, func()) {
 	t.Helper()
 	now := time.Now().UnixNano()
-	db, err := sql.Open("postgres", fmt.Sprintf("postgresql://postgres@localhost:5432/postgres?sslmode=disable&search_path=test_%d", now))
+	db, err := sql.Open("postgres", fmt.Sprintf("%s?sslmode=disable&search_path=test_%d", os.Getenv("DATABASE_URL"), now))
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -31,7 +32,7 @@ func openDB(t *testing.T) (*sql.DB, func()) {
 	if _, err := db.Exec(schema); err != nil {
 		t.Fatalf("failed to create schema: %v", err)
 	}
-	return db, func() {
+	return db, fmt.Sprintf("test_%d", now), func() {
 		query := fmt.Sprintf("DROP SCHEMA test_%d CASCADE;", now)
 		if _, err := db.Exec(query); err != nil {
 			t.Fatalf("failed to drop schema: %v", err)
@@ -43,9 +44,8 @@ func openDB(t *testing.T) (*sql.DB, func()) {
 }
 
 func TestMigrator(t *testing.T) {
-	t.Parallel()
 	t.Run("creates migrations table", func(t *testing.T) {
-		db, closeDB := openDB(t)
+		db, schema, closeDB := openDB(t)
 		defer closeDB()
 		m := New(db, testMigrations)
 		if err := m.createMigrationsTable(); err != nil {
@@ -54,13 +54,13 @@ func TestMigrator(t *testing.T) {
 
 		// Verify table exists
 		var exists bool
-		if err := db.QueryRow(`
+		if err := db.QueryRow(fmt.Sprintf(`
 			SELECT EXISTS (
 				SELECT FROM pg_tables
-				WHERE schemaname = 'public'
+				WHERE schemaname = '%s'
 				AND tablename = 'schema_migrations'
 			);
-		`).Scan(&exists); err != nil {
+		`, schema)).Scan(&exists); err != nil {
 			t.Fatalf("failed to check if migrations table exists: %v", err)
 		}
 		if !exists {
@@ -69,7 +69,7 @@ func TestMigrator(t *testing.T) {
 	})
 
 	t.Run("applies migrations in order", func(t *testing.T) {
-		db, closeDB := openDB(t)
+		db, _, closeDB := openDB(t)
 		defer closeDB()
 		m := New(db, testMigrations)
 		if err := m.Run(); err != nil {
@@ -124,7 +124,7 @@ func TestMigrator(t *testing.T) {
 	})
 
 	t.Run("skips already applied migrations", func(t *testing.T) {
-		db, closeDB := openDB(t)
+		db, _, closeDB := openDB(t)
 		defer closeDB()
 		m := New(db, testMigrations)
 
@@ -147,7 +147,7 @@ func TestMigrator(t *testing.T) {
 	})
 
 	t.Run("handles invalid migration files", func(t *testing.T) {
-		db, closeDB := openDB(t)
+		db, _, closeDB := openDB(t)
 		defer closeDB()
 		// Create a new migrator with invalid SQL
 		m := New(db, invalidTestMigrations)
