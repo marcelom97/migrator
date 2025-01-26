@@ -34,10 +34,27 @@ func (m *Migrator) tx(fun func(tx *sql.Tx) error) error {
 	return tx.Commit()
 }
 
-// Run applies all pending migrations
-func (m *Migrator) Run() error {
+func (m *Migrator) tryLock() (bool, error) {
 	var locked bool
 	err := m.db.QueryRow(`SELECT pg_try_advisory_lock(1)`).Scan(&locked)
+	if err != nil {
+		return false, fmt.Errorf("failed to acquire advisory lock: %w", err)
+	}
+	return locked, nil
+}
+
+func (m *Migrator) unlock() error {
+	var released bool
+	err := m.db.QueryRow(`SELECT pg_advisory_unlock(1)`).Scan(&released)
+	if err != nil {
+		return fmt.Errorf("failed to release advisory lock: %w", err)
+	}
+	return nil
+}
+
+// Run applies all pending migrations
+func (m *Migrator) Run() error {
+	locked, err := m.tryLock()
 	if err != nil {
 		return fmt.Errorf("failed to acquire advisory lock: %w", err)
 	}
@@ -45,16 +62,20 @@ func (m *Migrator) Run() error {
 		return fmt.Errorf("another migration is in progress")
 	}
 	defer func() {
-		var released bool
-		err := m.db.QueryRow(`SELECT pg_advisory_unlock(1)`).Scan(&released)
-		if err != nil {
-			fmt.Printf("failed to release advisory lock: %v\n", err)
+		if locked {
+			if err := m.unlock(); err != nil {
+				fmt.Printf("failed to release advisory lock: %v\n", err)
+			}
 		}
 	}()
 
 	return m.tx(func(tx *sql.Tx) error {
 		if err := m.createMigrationsTable(tx); err != nil {
 			return fmt.Errorf("failed to create migrations table: %w", err)
+		}
+
+		if _, err := tx.Exec(`LOCK TABLE schema_migrations IN ACCESS EXCLUSIVE MODE`); err != nil {
+			return fmt.Errorf("failed to lock schema_migrations: %w", err)
 		}
 
 		applied, err := m.getAppliedMigrations(tx)
