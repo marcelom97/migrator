@@ -1,4 +1,4 @@
-module github.com/marcelom97/migrator
+module github.com/marcelom97/migrator/v2
 
 go 1.23.5
 

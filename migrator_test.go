@@ -1,9 +1,12 @@
 package migrator
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -12,10 +15,28 @@ import (
 )
 
 //go:embed testdata/*.sql
-var testMigrations embed.FS
+var testMigrationsEmbed embed.FS
 
 //go:embed testdata/invalid/*.sql
-var invalidTestMigrations embed.FS
+var invalidTestMigrationsEmbed embed.FS
+
+func testMigrationsFS(t *testing.T) fs.FS {
+	t.Helper()
+	sub, err := fs.Sub(testMigrationsEmbed, "testdata")
+	if err != nil {
+		t.Fatalf("failed to create sub FS: %v", err)
+	}
+	return sub
+}
+
+func invalidMigrationsFS(t *testing.T) fs.FS {
+	t.Helper()
+	sub, err := fs.Sub(invalidTestMigrationsEmbed, "testdata/invalid")
+	if err != nil {
+		t.Fatalf("failed to create sub FS: %v", err)
+	}
+	return sub
+}
 
 func openDB(t *testing.T) (*sql.DB, string, func()) {
 	t.Helper()
@@ -47,35 +68,40 @@ func TestMigrator(t *testing.T) {
 	t.Run("creates migrations table", func(t *testing.T) {
 		db, schema, closeDB := openDB(t)
 		defer closeDB()
-		m := New(db, testMigrations)
-		if err := m.tx(func(tx *sql.Tx) error {
-			if err := m.createMigrationsTable(tx); err != nil {
-				return fmt.Errorf("failed to create migrations table: %w", err)
-			}
-			var exists bool
-			if err := tx.QueryRow(fmt.Sprintf(`
+
+		m, err := New(db, testMigrationsFS(t))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+
+		if err := m.Run(context.Background()); err != nil {
+			t.Fatalf("failed to run migrations: %v", err)
+		}
+
+		var exists bool
+		if err := db.QueryRow(fmt.Sprintf(`
 			SELECT EXISTS (
 				SELECT FROM pg_tables
 				WHERE schemaname = '%s'
 				AND tablename = 'schema_migrations'
 			);
 		`, schema)).Scan(&exists); err != nil {
-				return fmt.Errorf("failed to check if migrations table exists: %w", err)
-			}
-			if !exists {
-				return fmt.Errorf("migrations table does not exist")
-			}
-			return nil
-		}); err != nil {
-			t.Fatalf("failed to create migrations table: %v", err)
+			t.Fatalf("failed to check if migrations table exists: %v", err)
+		}
+		if !exists {
+			t.Fatal("migrations table does not exist")
 		}
 	})
 
 	t.Run("applies migrations in order", func(t *testing.T) {
 		db, _, closeDB := openDB(t)
 		defer closeDB()
-		m := New(db, testMigrations)
-		if err := m.Run(); err != nil {
+
+		m, err := New(db, testMigrationsFS(t))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+		if err := m.Run(context.Background()); err != nil {
 			t.Fatalf("failed to run migrations: %v", err)
 		}
 
@@ -126,12 +152,16 @@ func TestMigrator(t *testing.T) {
 	t.Run("skips already applied migrations", func(t *testing.T) {
 		db, _, closeDB := openDB(t)
 		defer closeDB()
-		m := New(db, testMigrations)
 
-		if err := m.Run(); err != nil {
+		m, err := New(db, testMigrationsFS(t))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+
+		if err := m.Run(context.Background()); err != nil {
 			t.Fatalf("failed to run migrations: %v", err)
 		}
-		if err := m.Run(); err != nil {
+		if err := m.Run(context.Background()); err != nil {
 			t.Fatalf("failed to run migrations: %v", err)
 		}
 
@@ -148,8 +178,11 @@ func TestMigrator(t *testing.T) {
 		db, _, closeDB := openDB(t)
 		defer closeDB()
 
-		m := New(db, invalidTestMigrations)
-		if err := m.Run(); err == nil {
+		m, err := New(db, invalidMigrationsFS(t))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+		if err := m.Run(context.Background()); err == nil {
 			t.Fatal("expected error, got nil")
 		}
 	})
@@ -191,8 +224,12 @@ func TestConcurrentMigrations(t *testing.T) {
 
 			for i := 0; i < tt.instances; i++ {
 				go func() {
-					m := New(db, testMigrations)
-					done <- m.Run()
+					m, err := New(db, testMigrationsFS(t))
+					if err != nil {
+						done <- err
+						return
+					}
+					done <- m.Run(context.Background())
 				}()
 			}
 
@@ -227,5 +264,97 @@ func TestConcurrentMigrations(t *testing.T) {
 				t.Fatalf("expected 2 applied migrations, got %d", count)
 			}
 		})
+	}
+}
+
+func TestNewValidation(t *testing.T) {
+	t.Run("nil db returns error", func(t *testing.T) {
+		_, err := New(nil, testMigrationsFS(t))
+		if err == nil {
+			t.Fatal("expected error for nil db, got nil")
+		}
+	})
+
+	t.Run("nil migrations returns error", func(t *testing.T) {
+		db, _, closeDB := openDB(t)
+		defer closeDB()
+
+		_, err := New(db, nil)
+		if err == nil {
+			t.Fatal("expected error for nil migrations, got nil")
+		}
+	})
+}
+
+func TestOptions(t *testing.T) {
+	t.Run("custom table name", func(t *testing.T) {
+		db, schema, closeDB := openDB(t)
+		defer closeDB()
+
+		m, err := New(db, testMigrationsFS(t), WithTableName("custom_migrations"))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+		if err := m.Run(context.Background()); err != nil {
+			t.Fatalf("failed to run migrations: %v", err)
+		}
+
+		var exists bool
+		if err := db.QueryRow(fmt.Sprintf(`
+			SELECT EXISTS (
+				SELECT FROM pg_tables
+				WHERE schemaname = '%s'
+				AND tablename = 'custom_migrations'
+			);
+		`, schema)).Scan(&exists); err != nil {
+			t.Fatalf("failed to check table: %v", err)
+		}
+		if !exists {
+			t.Fatal("custom_migrations table does not exist")
+		}
+	})
+
+	t.Run("custom lock id", func(t *testing.T) {
+		db, _, closeDB := openDB(t)
+		defer closeDB()
+
+		m, err := New(db, testMigrationsFS(t), WithLockID(99999))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+		if err := m.Run(context.Background()); err != nil {
+			t.Fatalf("failed to run migrations: %v", err)
+		}
+	})
+
+	t.Run("with logger", func(t *testing.T) {
+		db, _, closeDB := openDB(t)
+		defer closeDB()
+
+		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+		m, err := New(db, testMigrationsFS(t), WithLogger(logger))
+		if err != nil {
+			t.Fatalf("failed to create migrator: %v", err)
+		}
+		if err := m.Run(context.Background()); err != nil {
+			t.Fatalf("failed to run migrations: %v", err)
+		}
+	})
+}
+
+func TestRunWithCancelledContext(t *testing.T) {
+	db, _, closeDB := openDB(t)
+	defer closeDB()
+
+	m, err := New(db, testMigrationsFS(t))
+	if err != nil {
+		t.Fatalf("failed to create migrator: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := m.Run(ctx); err == nil {
+		t.Fatal("expected error for cancelled context, got nil")
 	}
 }
