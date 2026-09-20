@@ -3,19 +3,22 @@ package migrator
 import (
 	"io"
 	"log/slog"
+	"time"
 )
 
 type config struct {
-	tableName string
-	lockID    int64
-	logger    *slog.Logger
+	tableName   string
+	lockID      int64
+	lockTimeout time.Duration
+	logger      *slog.Logger
 }
 
 func defaultConfig() config {
 	return config{
-		tableName: "schema_migrations",
-		lockID:    5764249691895432819, // FNV-1a hash of "github.com/marcelom97/migrator"
-		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		tableName:   "schema_migrations",
+		lockID:      5764249691895432819, // FNV-1a hash of "github.com/marcelom97/migrator"
+		lockTimeout: 0,
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
 
@@ -35,6 +38,15 @@ func WithTableName(name string) Option {
 func WithLockID(id int64) Option {
 	return func(c *config) {
 		c.lockID = id
+	}
+}
+
+// WithLockTimeout sets how long Run waits for a concurrent migration before
+// returning ErrLockNotAcquired.
+// Default: 0, fail immediately.
+func WithLockTimeout(d time.Duration) Option {
+	return func(c *config) {
+		c.lockTimeout = d
 	}
 }
 

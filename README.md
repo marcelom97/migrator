@@ -87,6 +87,9 @@ migrator.WithLockID(42)
 
 // Custom structured logger (default: no-op)
 migrator.WithLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
+// Wait for a concurrent migration instead of failing immediately (default: 0, fail fast)
+migrator.WithLockTimeout(30 * time.Second)
 ```
 
 ## How It Works
@@ -105,8 +108,31 @@ migrator.WithLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 The migrator is designed to be safe in distributed environments where multiple instances might try to run migrations simultaneously:
 
 - Uses PostgreSQL advisory locks on a dedicated connection to ensure only one instance can run migrations at a time
-- Other instances will receive a "another migration is in progress" error
 - All database operations are wrapped in a transaction
+- A `*Migrator` is immutable after `New`, so a single instance can be shared across goroutines
+
+By default, an instance that cannot take the lock fails immediately with `ErrLockNotAcquired`:
+
+```go
+if err := m.Run(ctx); err != nil {
+    if errors.Is(err, migrator.ErrLockNotAcquired) {
+        // Another instance is migrating; carry on or retry.
+    }
+    return err
+}
+```
+
+Use `WithLockTimeout` to wait for the other instance to finish instead. This suits
+rolling deploys where every replica calls `Run` at startup and should boot only
+after the schema is current:
+
+```go
+m, err := migrator.New(db, migrations, migrator.WithLockTimeout(30*time.Second))
+```
+
+Replicas that arrive after the migration commits find nothing pending and return
+`nil`. `ErrLockNotAcquired` is returned only if the lock is still held when the
+timeout expires.
 
 ## Design Decisions
 

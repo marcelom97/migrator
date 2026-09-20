@@ -3,12 +3,17 @@ package migrator
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
 	"strings"
+	"time"
 )
+
+// ErrLockNotAcquired is returned by Run when another migration holds the advisory lock.
+var ErrLockNotAcquired = errors.New("another migration is in progress")
 
 // Migrator applies SQL migrations to a PostgreSQL database.
 type Migrator struct {
@@ -38,19 +43,73 @@ func New(db *sql.DB, migrations fs.FS, opts ...Option) (*Migrator, error) {
 	}, nil
 }
 
+// discardConn drops the session rather than pooling it. Close alone would hand
+// the next caller a session that may still hold the advisory lock.
+func discardConn(conn *sql.Conn) {
+	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+}
+
 func (m *Migrator) tryLock(ctx context.Context, conn *sql.Conn) (bool, error) {
 	var locked bool
 	err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, m.cfg.lockID).Scan(&locked)
 	if err != nil {
+		// The lock may have been granted before the error reached us.
+		discardConn(conn)
 		return false, fmt.Errorf("failed to acquire advisory lock: %w", err)
 	}
 	return locked, nil
+}
+
+// acquireLock takes the advisory lock, waiting up to cfg.lockTimeout for a
+// concurrent migration to release it.
+func (m *Migrator) acquireLock(ctx context.Context, conn *sql.Conn) error {
+	locked, err := m.tryLock(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if locked {
+		return nil
+	}
+	if m.cfg.lockTimeout <= 0 {
+		return ErrLockNotAcquired
+	}
+
+	const maxBackoff = time.Second
+	deadline := time.Now().Add(m.cfg.lockTimeout)
+	backoff := 50 * time.Millisecond
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ErrLockNotAcquired
+		}
+		wait := min(backoff, remaining)
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+
+		locked, err := m.tryLock(ctx, conn)
+		if err != nil {
+			return err
+		}
+		if locked {
+			return nil
+		}
+		backoff = min(backoff*2, maxBackoff)
+	}
 }
 
 func (m *Migrator) unlock(ctx context.Context, conn *sql.Conn) error {
 	var released bool
 	err := conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock($1)`, m.cfg.lockID).Scan(&released)
 	if err != nil {
+		// The unlock may not have run.
+		discardConn(conn)
 		return fmt.Errorf("failed to release advisory lock: %w", err)
 	}
 	if !released {
@@ -67,12 +126,8 @@ func (m *Migrator) Run(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	locked, err := m.tryLock(ctx, conn)
-	if err != nil {
-		return fmt.Errorf("failed to acquire advisory lock: %w", err)
-	}
-	if !locked {
-		return fmt.Errorf("another migration is in progress")
+	if err := m.acquireLock(ctx, conn); err != nil {
+		return err
 	}
 	defer func() {
 		if err := m.unlock(context.Background(), conn); err != nil {

@@ -42,7 +42,7 @@ jobs:
       - name: Run tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: go test -v ./...
+        run: go test -race -v ./...
 
   release:
     needs: test
